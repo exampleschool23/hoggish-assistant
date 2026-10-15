@@ -5,7 +5,8 @@ import { APICallError, RetryError } from 'ai';
  * - `daily`: per-day quota used up (recorded in the quota store)
  * - `rate`: per-minute or other short-lived 429
  * - `missing`: the model id does not exist for this key (404)
- * - `unavailable`: provider overloaded or failing (500, 503, 529)
+ * - `unavailable`: provider overloaded or failing (500, 503, 529), or it sent
+ *   nothing before the first-chunk timeout
  */
 export type FallbackReason = 'daily' | 'rate' | 'missing' | 'unavailable';
 
@@ -42,7 +43,19 @@ function errorText(error: unknown): string {
   return parts.join('\n');
 }
 
+/** Default wait for a model's first response chunk before moving to the next model. */
+export const FIRST_CHUNK_TIMEOUT_MS = 25_000;
+
+/** A model accepted the call but sent no response within the first-chunk timeout. */
+export class ModelTimeoutError extends Error {
+  constructor(readonly model: string, readonly timeoutMs: number) {
+    super(`No response from ${model} within ${timeoutMs} ms`);
+    this.name = 'ModelTimeoutError';
+  }
+}
+
 export function fallbackReason(error: unknown): FallbackReason | null {
+  if (error instanceof ModelTimeoutError) return 'unavailable';
   const status = statusCode(error);
   if (status === 429) return isDailyQuotaError(errorText(error)) ? 'daily' : 'rate';
   if (status === 404) return 'missing';

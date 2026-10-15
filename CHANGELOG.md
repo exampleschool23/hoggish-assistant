@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1
+
+- Time out stalled models: a model that accepts a call but sends no response chunk within
+  `firstChunkTimeoutMs` (new handler option, default 25 000 ms, 0 disables) is aborted and the call
+  moves to the next model, with the 60-second `unavailable` cooldown. Previously a stalled
+  `gemini-3.8-flash` could hold an answer for minutes. Once text has streamed, models are still never
+  swapped. `ModelTimeoutError` and `FIRST_CHUNK_TIMEOUT_MS` are exported.
+- Report every fallback: when a model fails and the chain moves on, the handler's `onError` gets
+  `stage: 'model'` with `provider`, `model`, `status` and `reason`. Still no message content.
+- `require('hoggish-assistant/…')` works: every export has a `default` condition (the ESM build;
+  CommonJS callers need Node 20.19+ or 22.12+, or a loader such as tsx). Previously it failed with
+  `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+
 ## 0.3.0
 
 - Show which model is answering: the stream sends a `model` event when a model accepts a call

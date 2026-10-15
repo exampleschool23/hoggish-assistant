@@ -6,6 +6,52 @@ import { LanguageModel } from 'ai';
 import { a as AssistantTools } from './tools-Bze-ziwC.js';
 export { A as AssistantFile, b as AssistantTool, T as ToolError, c as ToolRunOptions, d as defineTool, t as toBase64 } from './tools-Bze-ziwC.js';
 
+/**
+ * Why a model failed in a way that should move the turn to the next model:
+ * - `daily`: per-day quota used up (recorded in the quota store)
+ * - `rate`: per-minute or other short-lived 429
+ * - `missing`: the model id does not exist for this key (404)
+ * - `unavailable`: provider overloaded or failing (500, 503, 529), or it sent
+ *   nothing before the first-chunk timeout
+ */
+type FallbackReason = 'daily' | 'rate' | 'missing' | 'unavailable';
+/** How long this server instance skips a model after each kind of failure. */
+declare const COOLDOWN_MS: Record<FallbackReason, number>;
+/** Gemini says which quota a 429 hit; only a per-day limit lasts until reset. */
+declare function isDailyQuotaError(message: string | undefined): boolean;
+/** Default wait for a model's first response chunk before moving to the next model. */
+declare const FIRST_CHUNK_TIMEOUT_MS = 25000;
+/** A model accepted the call but sent no response within the first-chunk timeout. */
+declare class ModelTimeoutError extends Error {
+    readonly model: string;
+    readonly timeoutMs: number;
+    constructor(model: string, timeoutMs: number);
+}
+declare function fallbackReason(error: unknown): FallbackReason | null;
+/** Per-instance memory of models that recently failed. */
+declare class Cooldowns {
+    private readonly clock;
+    private readonly until;
+    constructor(clock?: () => number);
+    set(model: string, reason: FallbackReason): void;
+    isCooling(model: string): boolean;
+    clear(): void;
+}
+/**
+ * Models to try for one model call, strongest first. Models recorded as used
+ * up or cooling down are skipped; if that leaves nothing, the full chain is
+ * tried anyway, because the provider is the final authority on its quota.
+ * Models cooling down after a failure on this instance are never retried early.
+ */
+declare function modelsToTry<T extends {
+    model: string;
+}>(chain: readonly T[], skip: ReadonlySet<string>, cooldowns: Cooldowns): T[];
+/** Thrown when every model in the chain failed with a fallback error. */
+declare class ChainExhaustedError extends Error {
+    readonly errors: unknown[];
+    constructor(errors: unknown[]);
+}
+
 /** Provider-specific call options, keyed by provider (`google`, `anthropic`, …). */
 type ProviderOptions = Record<string, Record<string, unknown>>;
 /** Call settings that a model in a chain may override from its provider. */
@@ -160,7 +206,11 @@ interface ErrorInfo {
     stage: ErrorStage;
     provider?: string;
     tool?: string;
+    /** The model that failed, when the chain moved on to the next one. */
+    model?: string;
     status?: number;
+    /** Why the chain moved on (`stage: 'model'` fallbacks only). */
+    reason?: FallbackReason;
 }
 type MaybePromise<T> = T | Promise<T>;
 interface AssistantHandlerOptions<CTX> {
@@ -179,6 +229,12 @@ interface AssistantHandlerOptions<CTX> {
     tools?: (ctx: CTX) => MaybePromise<AssistantTools>;
     /** Daily request counts for quota-tracked models. */
     quotaStore?: QuotaStore;
+    /**
+     * Milliseconds each model may take to send its first response chunk before
+     * the call moves to the next model (with a cooldown, as for a 503). Default
+     * 25 000; 0 disables. Once text has streamed, a model is never swapped.
+     */
+    firstChunkTimeoutMs?: number;
     /** Model calls per question. Default 8. */
     maxRounds?: number;
     limits?: Partial<RequestLimits>;
@@ -188,7 +244,11 @@ interface AssistantHandlerOptions<CTX> {
     requestsPerQuestion?: number;
     /** Extra headers on every response (CORS for Edge Functions, for example). */
     headers?: Record<string, string>;
-    /** Logs failures. Defaults to a console.error without message content. */
+    /**
+     * Logs failures, including each model the chain skipped past (`stage:
+     * 'model'` with `model` and `reason`). Defaults to a console.error without
+     * message content.
+     */
     onError?: (error: unknown, info: ErrorInfo) => void;
 }
 /** Body of the usage endpoint (GET). */
@@ -218,43 +278,6 @@ declare function errorCode(error: unknown): AssistantErrorCode;
  */
 declare function createAssistantHandler<CTX>(options: AssistantHandlerOptions<CTX>): AssistantHandler;
 
-/**
- * Why a model failed in a way that should move the turn to the next model:
- * - `daily`: per-day quota used up (recorded in the quota store)
- * - `rate`: per-minute or other short-lived 429
- * - `missing`: the model id does not exist for this key (404)
- * - `unavailable`: provider overloaded or failing (500, 503, 529)
- */
-type FallbackReason = 'daily' | 'rate' | 'missing' | 'unavailable';
-/** How long this server instance skips a model after each kind of failure. */
-declare const COOLDOWN_MS: Record<FallbackReason, number>;
-/** Gemini says which quota a 429 hit; only a per-day limit lasts until reset. */
-declare function isDailyQuotaError(message: string | undefined): boolean;
-declare function fallbackReason(error: unknown): FallbackReason | null;
-/** Per-instance memory of models that recently failed. */
-declare class Cooldowns {
-    private readonly clock;
-    private readonly until;
-    constructor(clock?: () => number);
-    set(model: string, reason: FallbackReason): void;
-    isCooling(model: string): boolean;
-    clear(): void;
-}
-/**
- * Models to try for one model call, strongest first. Models recorded as used
- * up or cooling down are skipped; if that leaves nothing, the full chain is
- * tried anyway, because the provider is the final authority on its quota.
- * Models cooling down after a failure on this instance are never retried early.
- */
-declare function modelsToTry<T extends {
-    model: string;
-}>(chain: readonly T[], skip: ReadonlySet<string>, cooldowns: Cooldowns): T[];
-/** Thrown when every model in the chain failed with a fallback error. */
-declare class ChainExhaustedError extends Error {
-    readonly errors: unknown[];
-    constructor(errors: unknown[]);
-}
-
 /** Model calls per question; each tool round is one call. */
 declare const MAX_ROUNDS = 8;
 /**
@@ -279,9 +302,21 @@ interface TurnOptions {
     cooldowns: Cooldowns;
     onModelRequest?: (model: string, result: RequestResult) => void;
     onToolError?: (error: unknown, toolName: string) => void;
+    /**
+     * Milliseconds a model may take to send its first response chunk before the
+     * call moves to the next model. Default `FIRST_CHUNK_TIMEOUT_MS`; 0 disables.
+     */
+    firstChunkTimeoutMs?: number;
+    /** Called when a model fails and the call moves on to the next model in the chain. */
+    onFallback?: (error: unknown, info: FallbackInfo) => void;
     confirmationSecret?: string;
     /** A tool call the user confirmed; it runs before the model is called. */
     confirmed?: ConfirmedCall;
+}
+interface FallbackInfo {
+    model: string;
+    provider?: string;
+    reason: FallbackReason;
 }
 /**
  * Streams one answer: a bounded loop of model calls and tool calls. Each
@@ -305,5 +340,5 @@ interface ConfirmationPayload {
 declare function signConfirmation(secret: string, payload: ConfirmationPayload, now?: number): Promise<string>;
 declare function verifyConfirmation(secret: string, token: unknown, payload: ConfirmationPayload, now?: number): Promise<boolean>;
 
-export { AssistantError, AssistantErrorCode, AssistantEvent, AssistantTools, CONFIRMATION_TTL_MS, CONTEXT_WINDOWS, COOLDOWN_MS, ChainExhaustedError, ChatMessage, ConfirmedCall, Cooldowns, DEFAULT_CLAUDE_MODEL, FOREIGN_THOUGHT_SIGNATURE, GEMINI_FREE_MODELS, MAX_ROUNDS, ModelInfo, QuotaModel, QuotaStore, QuotaSummary, RequestLimits, RequestResult, anthropicProvider, contextWindowFor, createAssistantHandler, customProvider, errorCode, fallbackReason, geminiProvider, isDailyQuotaError, modelsToTry, providerChain, providerFromEnv, runTurn, signConfirmation, verifyConfirmation };
-export type { AnthropicProviderOptions, AssistantHandler, AssistantHandlerOptions, AssistantProvider, ChainLink, ChainModel, CustomProviderOptions, EnvSource, ErrorInfo, ErrorStage, FallbackReason, GeminiProviderOptions, ModelInput, ModelSettings, ProviderChainOptions, ProviderOptions, TurnOptions, UsageResponse };
+export { AssistantError, AssistantErrorCode, AssistantEvent, AssistantTools, CONFIRMATION_TTL_MS, CONTEXT_WINDOWS, COOLDOWN_MS, ChainExhaustedError, ChatMessage, ConfirmedCall, Cooldowns, DEFAULT_CLAUDE_MODEL, FIRST_CHUNK_TIMEOUT_MS, FOREIGN_THOUGHT_SIGNATURE, GEMINI_FREE_MODELS, MAX_ROUNDS, ModelInfo, ModelTimeoutError, QuotaModel, QuotaStore, QuotaSummary, RequestLimits, RequestResult, anthropicProvider, contextWindowFor, createAssistantHandler, customProvider, errorCode, fallbackReason, geminiProvider, isDailyQuotaError, modelsToTry, providerChain, providerFromEnv, runTurn, signConfirmation, verifyConfirmation };
+export type { AnthropicProviderOptions, AssistantHandler, AssistantHandlerOptions, AssistantProvider, ChainLink, ChainModel, CustomProviderOptions, EnvSource, ErrorInfo, ErrorStage, FallbackInfo, FallbackReason, GeminiProviderOptions, ModelInput, ModelSettings, ProviderChainOptions, ProviderOptions, TurnOptions, UsageResponse };

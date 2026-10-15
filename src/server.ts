@@ -49,10 +49,12 @@ export {
   COOLDOWN_MS,
   ChainExhaustedError,
   Cooldowns,
+  FIRST_CHUNK_TIMEOUT_MS,
+  ModelTimeoutError,
   fallbackReason,
   isDailyQuotaError,
   modelsToTry,
   type FallbackReason,
 } from './fallback';
-export { FOREIGN_THOUGHT_SIGNATURE, MAX_ROUNDS, runTurn, type TurnOptions } from './loop';
+export { FOREIGN_THOUGHT_SIGNATURE, MAX_ROUNDS, runTurn, type FallbackInfo, type TurnOptions } from './loop';
 export { CONFIRMATION_TTL_MS, signConfirmation, verifyConfirmation } from './confirm';

@@ -1,6 +1,6 @@
 import { verifyConfirmation } from './confirm';
 import { ERROR_STATUS, encodeEvent, type AssistantErrorCode, type AssistantEvent, type ModelInfo } from './events';
-import { ChainExhaustedError, Cooldowns, fallbackReason, modelsToTry, statusCode } from './fallback';
+import { ChainExhaustedError, Cooldowns, fallbackReason, modelsToTry, statusCode, type FallbackReason } from './fallback';
 import { MAX_ROUNDS, runTurn } from './loop';
 import type { AssistantProvider } from './providers';
 import { exhaustedModels, quotaDate, summarizeQuota, trackedModels, type QuotaStore, type QuotaSummary, type RequestResult } from './quota';
@@ -21,7 +21,11 @@ export interface ErrorInfo {
   stage: ErrorStage;
   provider?: string;
   tool?: string;
+  /** The model that failed, when the chain moved on to the next one. */
+  model?: string;
   status?: number;
+  /** Why the chain moved on (`stage: 'model'` fallbacks only). */
+  reason?: FallbackReason;
 }
 
 type MaybePromise<T> = T | Promise<T>;
@@ -42,6 +46,12 @@ export interface AssistantHandlerOptions<CTX> {
   tools?: (ctx: CTX) => MaybePromise<AssistantTools>;
   /** Daily request counts for quota-tracked models. */
   quotaStore?: QuotaStore;
+  /**
+   * Milliseconds each model may take to send its first response chunk before
+   * the call moves to the next model (with a cooldown, as for a 503). Default
+   * 25 000; 0 disables. Once text has streamed, a model is never swapped.
+   */
+  firstChunkTimeoutMs?: number;
   /** Model calls per question. Default 8. */
   maxRounds?: number;
   limits?: Partial<RequestLimits>;
@@ -51,7 +61,11 @@ export interface AssistantHandlerOptions<CTX> {
   requestsPerQuestion?: number;
   /** Extra headers on every response (CORS for Edge Functions, for example). */
   headers?: Record<string, string>;
-  /** Logs failures. Defaults to a console.error without message content. */
+  /**
+   * Logs failures, including each model the chain skipped past (`stage:
+   * 'model'` with `model` and `reason`). Defaults to a console.error without
+   * message content.
+   */
   onError?: (error: unknown, info: ErrorInfo) => void;
 }
 
@@ -243,6 +257,8 @@ export function createAssistantHandler<CTX>(options: AssistantHandlerOptions<CTX
             cooldowns,
             onModelRequest: record,
             onToolError: (error, tool) => onError(error, { stage: 'tool', provider: provider.name, tool }),
+            onFallback: (error, info) => onError(error, { stage: 'model', ...info, status: statusCode(error) }),
+            firstChunkTimeoutMs: options.firstChunkTimeoutMs,
             confirmationSecret: options.confirmationSecret,
             confirmed,
           });

@@ -9,7 +9,7 @@ import {
 } from 'ai';
 import { signConfirmation } from './confirm';
 import type { AssistantEvent } from './events';
-import { ChainExhaustedError, Cooldowns, fallbackReason, modelsToTry } from './fallback';
+import { ChainExhaustedError, Cooldowns, FIRST_CHUNK_TIMEOUT_MS, ModelTimeoutError, fallbackReason, modelsToTry, type FallbackReason } from './fallback';
 import { modelSettings, type AssistantProvider, type ChainModel } from './providers';
 import type { RequestResult } from './quota';
 import type { ChatMessage, ConfirmedCall } from './request';
@@ -48,9 +48,22 @@ export interface TurnOptions {
   cooldowns: Cooldowns;
   onModelRequest?: (model: string, result: RequestResult) => void;
   onToolError?: (error: unknown, toolName: string) => void;
+  /**
+   * Milliseconds a model may take to send its first response chunk before the
+   * call moves to the next model. Default `FIRST_CHUNK_TIMEOUT_MS`; 0 disables.
+   */
+  firstChunkTimeoutMs?: number;
+  /** Called when a model fails and the call moves on to the next model in the chain. */
+  onFallback?: (error: unknown, info: FallbackInfo) => void;
   confirmationSecret?: string;
   /** A tool call the user confirmed; it runs before the model is called. */
   confirmed?: ConfirmedCall;
+}
+
+export interface FallbackInfo {
+  model: string;
+  provider?: string;
+  reason: FallbackReason;
 }
 
 interface Turn {
@@ -141,6 +154,8 @@ class AbortedError extends Error {
   }
 }
 
+const TIMED_OUT = Symbol('timed out');
+
 const RESPONSE_PARTS = new Set(['text-delta', 'text-start', 'reasoning-start', 'reasoning-delta', 'tool-input-start', 'tool-call', 'finish-step']);
 
 /**
@@ -150,6 +165,7 @@ const RESPONSE_PARTS = new Set(['text-delta', 'text-start', 'reasoning-start', '
  */
 export async function runTurn(options: TurnOptions): Promise<void> {
   const { provider, send, signal, tools, cooldowns } = options;
+  const firstChunkTimeoutMs = options.firstChunkTimeoutMs ?? FIRST_CHUNK_TIMEOUT_MS;
   const maxRounds = options.maxRounds ?? MAX_ROUNDS;
   const skip = new Set(options.skipModels ?? []);
   const toolSet = sdkTools(tools);
@@ -203,6 +219,16 @@ export async function runTurn(options: TurnOptions): Promise<void> {
       let roundText = false;
       let accepted = false;
       const settings = modelSettings(provider, entry);
+      // Aborts this model's call alone on a stall; the request signal aborts it too.
+      const call = new AbortController();
+      const abortCall = () => call.abort(signal.reason);
+      signal.addEventListener('abort', abortCall, { once: true });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stalled = firstChunkTimeoutMs > 0
+        ? new Promise<typeof TIMED_OUT>((resolve) => {
+          timer = setTimeout(() => resolve(TIMED_OUT), firstChunkTimeoutMs);
+        })
+        : undefined;
       try {
         const result = streamText({
           model: entry.languageModel,
@@ -212,7 +238,7 @@ export async function runTurn(options: TurnOptions): Promise<void> {
           maxRetries: provider.maxRetries,
           ...(settings.maxOutputTokens ? { maxOutputTokens: settings.maxOutputTokens } : {}),
           ...(settings.providerOptions ? { providerOptions: settings.providerOptions as never } : {}),
-          abortSignal: signal,
+          abortSignal: call.signal,
           // The AI SDK's default logs the whole error, whose requestBodyValues
           // hold the prompt, history and tool results. Errors still reach the
           // stream below and the handler's content-free `onError`.
@@ -220,9 +246,21 @@ export async function runTurn(options: TurnOptions): Promise<void> {
         });
         const calls: ToolCall[] = [];
         let finishReason: FinishReason | undefined;
-        for await (const part of result.stream) {
+        const parts = result.stream[Symbol.asyncIterator]();
+        for (;;) {
+          // Until the model sends its first response chunk, a stall moves the
+          // call to the next model; afterwards the stream is awaited as is.
+          const next = !accepted && stalled ? await Promise.race([parts.next(), stalled]) : await parts.next();
+          if (next === TIMED_OUT) {
+            call.abort();
+            parts.return?.().catch(() => {});
+            throw new ModelTimeoutError(entry.model, firstChunkTimeoutMs);
+          }
+          if (next.done) break;
+          const part = next.value;
           if (!accepted && RESPONSE_PARTS.has(part.type)) {
             accepted = true;
+            clearTimeout(timer);
             options.onModelRequest?.(entry.model, 'ok');
             send({
               type: 'model',
@@ -268,7 +306,12 @@ export async function runTurn(options: TurnOptions): Promise<void> {
           skip.add(entry.model);
           options.onModelRequest?.(entry.model, 'daily_limit');
         }
+        const providerName = entry.provider ?? provider.name;
+        options.onFallback?.(error, { model: entry.model, ...(providerName ? { provider: providerName } : {}), reason });
         errors.push(error);
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', abortCall);
       }
     }
     throw new ChainExhaustedError(errors);

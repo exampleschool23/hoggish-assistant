@@ -14,10 +14,16 @@ export interface Step {
   finish?: 'stop' | 'tool-calls' | 'length' | 'content-filter';
   /** Emitted as a stream error after the text. */
   errorAfterText?: unknown;
+  /** Waits this long (setTimeout, so fake timers apply) after the text before finishing. */
+  pauseAfterTextMs?: number;
 }
 
-/** A model call either streams a step or fails before streaming. */
-export type Response = Step | Error;
+/** The model accepts the call, then never sends a chunk until the call is aborted. */
+export const STALL = { stall: true } as const;
+
+/** A model call streams a step, stalls, or fails before streaming. */
+export type Response = Step | Error | typeof STALL;
+
 
 function chunksFor(step: Step): unknown[] {
   const chunks: unknown[] = [{ type: 'stream-start', warnings: [] }];
@@ -49,15 +55,30 @@ export function mockModel(id: string, responses: Response[]) {
   let index = 0;
   const model = new MockLanguageModelV4({
     modelId: id,
-    doStream: async () => {
+    doStream: async ({ abortSignal }) => {
       const response = responses[Math.min(index, responses.length - 1)]!;
       index += 1;
       if (response instanceof Error) throw response;
+      if ('stall' in response) {
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              // Like an aborted fetch: the only way this stream ends.
+              abortSignal?.addEventListener('abort', () => controller.error(abortSignal.reason), { once: true });
+            },
+          }),
+        };
+      }
       const chunks = chunksFor(response);
+      const pause = response.pauseAfterTextMs;
+      const textEnd = chunks.findIndex((chunk) => (chunk as { type: string }).type === 'text-end') + 1;
       return {
         stream: new ReadableStream({
-          start(controller) {
-            for (const chunk of chunks) controller.enqueue(chunk as never);
+          async start(controller) {
+            for (const [position, chunk] of chunks.entries()) {
+              if (pause && position === textEnd) await new Promise((resolve) => setTimeout(resolve, pause));
+              controller.enqueue(chunk as never);
+            }
             controller.close();
           },
         }),

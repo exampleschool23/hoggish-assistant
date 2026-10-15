@@ -1,6 +1,6 @@
 {
   "name": "hoggish-assistant",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Shared AI chat assistant: provider fallback chain, quota tracking, confirm-before-action tool loop, NDJSON streaming, React hook, Markdown and Excel helpers.",
   "license": "MIT",
   "type": "module",
@@ -20,27 +20,33 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./server": {
       "types": "./dist/server.d.ts",
-      "import": "./dist/server.js"
+      "import": "./dist/server.js",
+      "default": "./dist/server.js"
     },
     "./react": {
       "types": "./dist/react.d.ts",
-      "import": "./dist/react.js"
+      "import": "./dist/react.js",
+      "default": "./dist/react.js"
     },
     "./markdown": {
       "types": "./dist/markdown.d.ts",
-      "import": "./dist/markdown.js"
+      "import": "./dist/markdown.js",
+      "default": "./dist/markdown.js"
     },
     "./excel": {
       "types": "./dist/excel.d.ts",
-      "import": "./dist/excel.js"
+      "import": "./dist/excel.js",
+      "default": "./dist/excel.js"
     },
     "./supabase": {
       "types": "./dist/supabase.d.ts",
-      "import": "./dist/supabase.js"
+      "import": "./dist/supabase.js",
+      "default": "./dist/supabase.js"
     },
     "./sql/assistant_model_usage.sql": "./sql/assistant_model_usage.sql",
     "./package.json": "./package.json"

@@ -76,7 +76,19 @@ function errorText(error) {
   if (APICallError.isInstance(root) && root.responseBody) parts.push(root.responseBody);
   return parts.join("\n");
 }
+var FIRST_CHUNK_TIMEOUT_MS = 25e3;
+var ModelTimeoutError = class extends Error {
+  constructor(model, timeoutMs) {
+    super(`No response from ${model} within ${timeoutMs} ms`);
+    this.model = model;
+    this.timeoutMs = timeoutMs;
+    this.name = "ModelTimeoutError";
+  }
+  model;
+  timeoutMs;
+};
 function fallbackReason(error) {
+  if (error instanceof ModelTimeoutError) return "unavailable";
   const status = statusCode(error);
   if (status === 429) return isDailyQuotaError(errorText(error)) ? "daily" : "rate";
   if (status === 404) return "missing";
@@ -323,9 +335,11 @@ var AbortedError = class extends Error {
     this.name = "AbortError";
   }
 };
+var TIMED_OUT = /* @__PURE__ */ Symbol("timed out");
 var RESPONSE_PARTS = /* @__PURE__ */ new Set(["text-delta", "text-start", "reasoning-start", "reasoning-delta", "tool-input-start", "tool-call", "finish-step"]);
 async function runTurn(options) {
   const { provider, send, signal, tools, cooldowns } = options;
+  const firstChunkTimeoutMs = options.firstChunkTimeoutMs ?? FIRST_CHUNK_TIMEOUT_MS;
   const maxRounds = options.maxRounds ?? MAX_ROUNDS;
   const skip = new Set(options.skipModels ?? []);
   const toolSet = sdkTools(tools);
@@ -374,6 +388,13 @@ async function runTurn(options) {
       let roundText = false;
       let accepted = false;
       const settings = modelSettings(provider, entry);
+      const call = new AbortController();
+      const abortCall = () => call.abort(signal.reason);
+      signal.addEventListener("abort", abortCall, { once: true });
+      let timer;
+      const stalled = firstChunkTimeoutMs > 0 ? new Promise((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), firstChunkTimeoutMs);
+      }) : void 0;
       try {
         const result = streamText({
           model: entry.languageModel,
@@ -383,7 +404,7 @@ async function runTurn(options) {
           maxRetries: provider.maxRetries,
           ...settings.maxOutputTokens ? { maxOutputTokens: settings.maxOutputTokens } : {},
           ...settings.providerOptions ? { providerOptions: settings.providerOptions } : {},
-          abortSignal: signal,
+          abortSignal: call.signal,
           // The AI SDK's default logs the whole error, whose requestBodyValues
           // hold the prompt, history and tool results. Errors still reach the
           // stream below and the handler's content-free `onError`.
@@ -392,9 +413,20 @@ async function runTurn(options) {
         });
         const calls = [];
         let finishReason;
-        for await (const part of result.stream) {
+        const parts = result.stream[Symbol.asyncIterator]();
+        for (; ; ) {
+          const next = !accepted && stalled ? await Promise.race([parts.next(), stalled]) : await parts.next();
+          if (next === TIMED_OUT) {
+            call.abort();
+            parts.return?.().catch(() => {
+            });
+            throw new ModelTimeoutError(entry.model, firstChunkTimeoutMs);
+          }
+          if (next.done) break;
+          const part = next.value;
           if (!accepted && RESPONSE_PARTS.has(part.type)) {
             accepted = true;
+            clearTimeout(timer);
             options.onModelRequest?.(entry.model, "ok");
             send({
               type: "model",
@@ -441,7 +473,12 @@ ${part.text}` : part.text });
           skip.add(entry.model);
           options.onModelRequest?.(entry.model, "daily_limit");
         }
+        const providerName = entry.provider ?? provider.name;
+        options.onFallback?.(error, { model: entry.model, ...providerName ? { provider: providerName } : {}, reason });
         errors.push(error);
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abortCall);
       }
     }
     throw new ChainExhaustedError(errors);
@@ -644,6 +681,8 @@ function createAssistantHandler(options) {
             cooldowns,
             onModelRequest: record,
             onToolError: (error, tool) => onError(error, { stage: "tool", provider: provider.name, tool }),
+            onFallback: (error, info) => onError(error, { stage: "model", ...info, status: statusCode(error) }),
+            firstChunkTimeoutMs: options.firstChunkTimeoutMs,
             confirmationSecret: options.confirmationSecret,
             confirmed
           });
@@ -711,6 +750,6 @@ function createAssistantHandler(options) {
   };
 }
 
-export { AssistantError, CONFIRMATION_TTL_MS, CONTEXT_WINDOWS, COOLDOWN_MS, ChainExhaustedError, Cooldowns, DEFAULT_CLAUDE_MODEL, FOREIGN_THOUGHT_SIGNATURE, GEMINI_FREE_MODELS, MAX_ROUNDS, ToolError, anthropicProvider, contextWindowFor, createAssistantHandler, customProvider, defineTool, errorCode, fallbackReason, geminiProvider, isDailyQuotaError, modelsToTry, providerChain, providerFromEnv, runTurn, signConfirmation, toBase64, verifyConfirmation };
+export { AssistantError, CONFIRMATION_TTL_MS, CONTEXT_WINDOWS, COOLDOWN_MS, ChainExhaustedError, Cooldowns, DEFAULT_CLAUDE_MODEL, FIRST_CHUNK_TIMEOUT_MS, FOREIGN_THOUGHT_SIGNATURE, GEMINI_FREE_MODELS, MAX_ROUNDS, ModelTimeoutError, ToolError, anthropicProvider, contextWindowFor, createAssistantHandler, customProvider, defineTool, errorCode, fallbackReason, geminiProvider, isDailyQuotaError, modelsToTry, providerChain, providerFromEnv, runTurn, signConfirmation, toBase64, verifyConfirmation };
 //# sourceMappingURL=server.js.map
 //# sourceMappingURL=server.js.map

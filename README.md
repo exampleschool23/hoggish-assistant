@@ -32,7 +32,7 @@ prompt and API key. Give each app its own Google project so each gets its own fr
 ```json
 {
   "dependencies": {
-    "hoggish-assistant": "github:exampleschool23/hoggish-assistant#v0.3.0"
+    "hoggish-assistant": "github:exampleschool23/hoggish-assistant#v0.3.1"
   }
 }
 ```
@@ -61,6 +61,9 @@ Peer dependencies:
 
 The core and server entries use only Web APIs (`fetch`, Web Crypto, `TextEncoder`, `btoa`) and no
 Node built-ins.
+
+The package is ESM. CommonJS code can `require()` any entry on Node 20.19+ or 22.12+ (or through a
+loader such as tsx), which loads the same ESM build.
 
 ## Providers: switching is a configuration change
 
@@ -136,9 +139,17 @@ language model, such as OpenAI, Bedrock or Vertex.
   value.
 - A per-day 429 marks the model as used up in the quota store. 404 and 5xx errors, and per-minute
   429s, only put the model on a cooldown on this server instance: 60 seconds, or 1 hour for a 404.
+- A model that accepts a call but sends no response chunk within `firstChunkTimeoutMs` (handler
+  option, default 25 000 ms; 0 disables) is aborted and treated like a 503: the call moves to the
+  next model and the stalled one cools down for 60 seconds. Keep it well below your route's
+  `maxDuration`.
+- Every skipped model is reported to `onError` with `stage: 'model'`, the `provider`, `model`, HTTP
+  `status` (when there is one) and `reason` (`daily`, `rate`, `missing` or `unavailable`), so logs
+  show why a stronger model did not answer.
 - If the store says every model is used up, the chain is tried anyway, because the provider is the
   final authority on its own quota.
-- Once text has streamed for a model call, errors are not retried on another model. The user sees
+- Once text has streamed for a model call, errors are not retried on another model, and pauses are
+  not timed out. The user sees
   `BUSY` or `SERVER_ERROR` after the partial text.
 - Chains with more than one model default to `maxRetries: 0`, so fallback is immediate.
 
@@ -525,7 +536,8 @@ characters and de-duplicated. The header row is frozen and gets an auto-filter.
 - `authorize` must validate the session on the server, for example with Supabase `auth.getUser()`,
   and check membership for the requested `context`.
 - Tools enforce their own access rules. The UI is not an authorization boundary.
-- The default `onError` logs the stage, provider, tool name and HTTP status, never message content.
+- The default `onError` logs the stage, provider, model, tool name, HTTP status and fallback reason,
+  never message content.
 
 ## Development
 
